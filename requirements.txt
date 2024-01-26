@@ -1,0 +1,3 @@
+awscrt
+awsiot
+python-dotenv
