@@ -21,9 +21,6 @@ if __name__ == "__main__":
         cert_filepath=f"{auth_directory}/{thing_name}.cert.pem",
         pri_key_filepath=f"{auth_directory}/{thing_name}.private.key",
         root_ca_filepath=f"{auth_directory}/root-CA.crt",
-        initial_state={
-            "hello": "world",
-        },
         override_cloud_state=False,
         clean_session=False,
         keep_alive_secs=30,
@@ -32,9 +29,12 @@ if __name__ == "__main__":
         verbose=True,
     )
 
-    thing.connect()
-    sleep(5)
-    thing.update_shadow_state_synchronous({"foo": "bar"}, timeout=5)
-    sleep(1)
-    print(json.dumps(thing.get_state(), indent=4))
-    thing.disconnect()
+    connected = thing.connect()
+    thing.init_state()
+    if connected:
+        # sleep(30)
+        sleep(5)
+        thing.update_shadow_state_synchronous({"foo": "bing"}, timeout=5)
+        # sleep(1)
+        # print(json.dumps(thing.get_state(), indent=4))
+        thing.disconnect()

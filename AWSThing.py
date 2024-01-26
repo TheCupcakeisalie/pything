@@ -1,6 +1,7 @@
 import asyncio
 from copy import deepcopy
-import json
+
+import socket
 import sys
 import threading
 import time
@@ -9,7 +10,24 @@ from uuid import UUID, uuid4
 from awsiot import mqtt_connection_builder, iotshadow
 from awsiot.iotshadow import IotShadowClient, ShadowStateWithDelta, ShadowState
 from awscrt import mqtt
+from awscrt.exceptions import AwsCrtError
 import logging
+
+
+def check_connectivity(host="8.8.8.8", port=53, timeout=3):
+    """
+    Credit to: https://stackoverflow.com/a/33117579
+    Host: 8.8.8.8 (google-public-dns-a.google.com)
+    OpenPort: 53/tcp
+    Service: domain (DNS/TCP)
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except socket.error as ex:
+        print(ex)
+        return False
 
 
 # Callback when connection is accidentally lost.
@@ -171,13 +189,20 @@ class AWSIOTThing:
             on_resubscribe_complete=on_resubscribe_complete,
         )
         connect_future = mqtt_connection.connect()
-        connect_future.result()
+        try:
+            connect_future.result()
+        except AwsCrtError as e:
+            print(f"Failed to connect to AWS {e}")
+            return False
+
         print(f"{self.name}: Base connection established. Connecting to shadow...")
         self.mqtt_connection = mqtt_connection
 
         if self.initial_state is not None:
             self.smart_shadow = SmartShadow(mqtt_connection, self.name, self.initial_state, self.override_cloud_state)
             self.smart_shadow.connect()
+
+        return True
 
     def publish(self, topic: str, payload: str, qos: Optional[mqtt.QoS] = None, fire_and_forget: bool = False):
         publish_future, _ = self.mqtt_connection.publish(
@@ -227,11 +252,14 @@ class AWSIOTThing:
         print(f"{self.name}: Shadow update complete.")
 
     def update_shadow_state_synchronous(self, state: dict, timeout: int = 15) -> None:
-        if self.smart_shadow is None:
+        if not hasattr(self, "smart_shadow") or self.smart_shadow is None:
             print(f"{self.name}: No shadow connected, cannot update state.")
             return None
 
         waited_secs = 0
+        if state == self.smart_shadow.get_state():
+            print("Current state matches requested state. Ignoring state update.")
+            return
         self.smart_shadow.update_shadow_state(state)
         while self.smart_shadow.get_state() != state:
             print(f"{self.name}: Waiting for shadow update to complete...")
@@ -241,6 +269,16 @@ class AWSIOTThing:
                 raise TimeoutError(f"{self.name}: Shadow update timed out after {timeout} seconds.")
 
         print(f"{self.name}: Shadow update complete.")
+
+    def init_state(self, clear=False, override_cloud_state=False) -> bool:
+        if not hasattr(self, "smart_shadow") or self.smart_shadow is None or clear:
+            self.smart_shadow = SmartShadow(self.mqtt_connection, self.name, {}, override_cloud_state)
+            self.smart_shadow.connect()
+            return True
+        elif self.smart_shadow is not None and not clear:
+            print("Refusing to reinitialize shadow state because clear was set to False.")
+
+        return False
 
 
 class SmartShadow:
@@ -310,11 +348,32 @@ class SmartShadow:
                 print(f"Updated state for shadow {self.thing_name} to {self.state}")
         return changed
 
+    def _publish_update(self, state: ShadowState | ShadowStateWithDelta):
+        with self.lock:
+            canonical_state = self.state
+            if state.desired is not None and self.state is not None:
+                canonical_state = self.state | filter_dict_for_null_values(state.desired)
+
+            generic_token = str(uuid4())
+            print(canonical_state)
+            self.shadow_client.publish_update_shadow(
+                request=iotshadow.UpdateShadowRequest(
+                    thing_name=self.thing_name,
+                    state=iotshadow.ShadowState(desired=canonical_state, reported=canonical_state),
+                    client_token=generic_token,
+                ),
+                qos=mqtt.QoS.AT_LEAST_ONCE,
+            )
+        self.add_request_token(generic_token)
+
     def receive_explicitly_requested_state(self, response: iotshadow.GetShadowResponse) -> None:
         print(f"Received state for shadow {response.client_token} with payload {response.state}")
         self.remove_request_token(response.client_token)
         state: ShadowStateWithDelta = response.state  # type: ignore
-        self.modify_local_state(state)
+        changed = self.modify_local_state(state)
+        if changed:
+            print("Cloud state differed from local state. Reporting to cloud that we have consumed their request.")
+            self._publish_update(state)
 
     def receive_updated_state(self, response: iotshadow.UpdateShadowResponse) -> None:
         print(f"Received update for shadow {response.client_token} with payload {response.state}")
@@ -322,21 +381,7 @@ class SmartShadow:
         state: ShadowState = response.state  # type: ignore
         changed = self.modify_local_state(state)
         if changed:
-            with self.lock:
-                canonical_state = self.state
-                if state.desired is not None and self.state is not None:
-                    canonical_state = self.state | filter_dict_for_null_values(state.desired)
-
-                generic_token = str(uuid4())
-                self.shadow_client.publish_update_shadow(
-                    request=iotshadow.UpdateShadowRequest(
-                        thing_name=self.thing_name,
-                        state=iotshadow.ShadowState(desired=self.state, reported=canonical_state),
-                        client_token=generic_token,
-                    ),
-                    qos=mqtt.QoS.AT_LEAST_ONCE,
-                )
-            self.add_request_token(generic_token)
+            self._publish_update(state)
 
     def get_state(self) -> Optional[dict]:
         with self.lock:
@@ -442,6 +487,7 @@ class SmartShadow:
         generic_token = str(uuid4())
         with self.lock:
             publish_update_future = self.shadow_client.publish_update_shadow(
+                # TODO: why doesn't just publishing to reported work?
                 request=iotshadow.UpdateShadowRequest(
                     thing_name=self.thing_name,
                     state=iotshadow.ShadowState(desired=canonical_state, reported=canonical_state),
@@ -453,8 +499,8 @@ class SmartShadow:
         publish_update_future.result()
 
     def handle_delta_update(self, response: iotshadow.ShadowDeltaUpdatedEvent) -> None:
-        # TODO: implement
-        pass
+        print("delta update")
+        print(response)
 
     def connect(self) -> None:
         """
